@@ -86,7 +86,7 @@ const _o = new Float64Array(4), _m = [0, 0], _m2 = [0, 0];
 const _samp = new Float64Array(40 * 4);
 function alphaBucket(mat, a) {
   if (mat.alphaMode === 'MASK') return a >= mat.cutoff ? 20 : 0;
-  if (mat.alphaMode === 'BLEND') { const k = Math.round(a * 20); return k >= 20 ? 20 : k; }
+  if (mat.alphaMode === 'BLEND') { if (a < 0.04) return 0; const k = Math.round(a * 20); return k >= 20 ? 20 : k < 1 ? 1 : k; }   // deyarli ko‘rinmas yuza (alfa < 0.04) olib tashlanadi
   return 20;
 }
 
@@ -341,6 +341,7 @@ function readOptions() {
     scale: numVal('scale', 1, 1e-6, 1e6),
     decimals: parseInt($('decimals').value, 10) || 0,
     maxFaces: Math.round(numVal('maxFaces', 1000000, 1000, 20000000)),
+    dropInvisible: $('dropInvisible').checked,
   };
 }
 
@@ -402,7 +403,53 @@ async function analyze(job) {
     size: [size.x, size.y, size.z], box,
   };
   detectGroups(job);
+  markInvisible(job);
 }
+
+// ---------- Ko‘rinmas narsalar ----------
+// GLB da ko‘rinmas, lekin geometriyasi bor narsalar (kollizion kub, yordamchi mesh, to‘liq shaffof material) JSON ga o‘tmaydi:
+// aks holda ular modelning o‘lchamini kattalashtirib, o‘yinda mashina devorga yetmasdan urilishiga sabab bo‘ladi.
+function markInvisible(job) {
+  if (!job.gltf) return;
+  let re = null;
+  try { const s = $('hideRe').value.trim(); re = s ? new RegExp(s, 'i') : null; } catch (e) { re = null; }
+  const drop = $('dropInvisible').checked;
+  job.invis = [];
+  for (const it of job.items) {
+    it.skip = '';
+    const mesh = it.mesh, tm = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
+    const assoc = tm && job.parser.associations ? job.parser.associations.get(tm) : null;
+    const def = assoc && assoc.materials !== undefined ? job.json.materials[assoc.materials] : null;
+    const pbr = (def && def.pbrMetallicRoughness) || {};
+    let why = '';
+    if (tm && (tm.visible === false || tm.colorWrite === false)) why = 'material ko‘rinmas';
+    else if (tm && tm.transparent && tm.opacity <= 0.02) why = 'to‘liq shaffof';
+    else if (def && def.alphaMode === 'BLEND' && !pbr.baseColorTexture && (pbr.baseColorFactor ? pbr.baseColorFactor[3] : 1) < 0.04) why = 'to‘liq shaffof (alfa 0)';
+    if (!why && re) {
+      const names = [mesh.name, tm && tm.name, def && def.name];
+      for (let n = mesh.parent; n && n !== job.gltf.scene; n = n.parent) names.push(n.name);
+      if (names.some((n) => n && re.test(n))) why = 'yordamchi/kollizion nom';
+    }
+    if (!why) {
+      const g = mesh.geometry;
+      if (!g.boundingBox) g.computeBoundingBox();
+      const bb = g.boundingBox;
+      if (bb && bb.isBox3 && !bb.isEmpty() && bb.getSize(new THREE.Vector3()).length() < 1e-9) why = 'nuqtaga aylangan (o‘lchami yo‘q)';
+    }
+    if (why) { it.skip = why; job.invis.push({ name: mesh.name || (tm && tm.name) || 'mesh', why }); }
+  }
+  if (job.items.length && job.items.every((i) => i.skip)) {   // hammasi ko‘rinmas deb topilsa, xavfsizlik uchun hech narsa olib tashlanmaydi
+    job.items.forEach((i) => { i.skip = ''; });
+    job.invis = [];
+    job.notes = job.notes.filter((n) => !/Hamma mesh/.test(n)); job.notes.push('Hamma mesh ko‘rinmas deb topildi, shuning uchun hech narsa olib tashlanmadi. Nom regexini tekshiring.');
+  }
+  // Modelning haqiqiy (ko‘rinadigan) o‘lchami
+  const box = new THREE.Box3();
+  for (const it of job.items) if (!(drop && it.skip)) box.union(new THREE.Box3().setFromObject(it.mesh, true));
+  if (!box.isEmpty() && job.info) { const sz = box.getSize(new THREE.Vector3()); job.info.size = [sz.x, sz.y, sz.z]; job.info.box = box; }
+}
+$('hideRe').addEventListener('change', () => { jobs.forEach((j) => { if (!j.busy) markInvisible(j); }); renderJobs(); });
+$('dropInvisible').addEventListener('change', () => { jobs.forEach((j) => { if (!j.busy) markInvisible(j); }); renderJobs(); });
 
 function detectGroups(job) {
   if (!job.gltf) return;
@@ -496,6 +543,8 @@ async function buildMatInfo(job, idx, tm) {
   info.mat.base = [baseF[0], baseF[1], baseF[2], baseF[3] === undefined ? 1 : baseF[3]];
   info.mat.alphaMode = def.alphaMode || 'OPAQUE';
   info.mat.cutoff = def.alphaCutoff === undefined ? 0.5 : def.alphaCutoff;
+  const trn = def.extensions && def.extensions.KHR_materials_transmission;
+  if (trn && trn.transmissionFactor > 0 && info.mat.alphaMode === 'OPAQUE') { info.mat.alphaMode = 'BLEND'; info.mat.base[3] *= Math.max(0.12, 1 - 0.85 * trn.transmissionFactor); }   // shaffof shisha: to‘q rangli qattiq jism bo‘lib qolmasin
   const bs = await makeSampler(job, baseT);
   if (bs) { info.mat.texBase = bs.sampler; info.chBase = bs.ch; }
   const ef = def.emissiveFactor;
@@ -520,7 +569,7 @@ async function getMatInfo(job, mesh) {
 // ---------- Aylantirish ----------
 async function convertJob(job) {
   if (job.busy || !job.gltf) return;
-  job.busy = true; job.result = null; job.previewJson = null; job.notes = job.notes.filter((n) => /kichraytirildi|KTX2|Tekstura/.test(n));
+  job.busy = true; job.result = null; job.previewJson = null; job.faceInvis = []; job.notes = job.notes.filter((n) => /kichraytirildi|KTX2|Tekstura|Hamma mesh/.test(n));
   const t0 = performance.now();
   const opt = readOptions();
   job.status = 'Boshlanmoqda…'; job.statusClass = ''; job.progress = 0;
@@ -532,15 +581,17 @@ async function convertJob(job) {
     opt.minEdge = Math.max(size[0], size[1], size[2]) * sc * 2e-4;
     const sink = new Sink();
     let totalTris = 0;
-    for (const it of job.items) { const g = it.mesh.geometry; totalTris += Math.floor((g.index ? g.index.count : g.attributes.position.count) / 3); }
+    const useItems = job.items.filter((it) => !(opt.dropInvisible && it.skip));
+    for (const it of useItems) { const g = it.mesh.geometry; totalTris += Math.floor((g.index ? g.index.count : g.attributes.position.count) / 3); }
     let done = 0, last = performance.now();
     const P = new Float64Array(9), uvA = new Float64Array(6), uvE = new Float64Array(6), vcA = new Float64Array(12);
     const groupIdx = new Map(job.groups.map((g, i) => [g, i]));
     const degEps = Math.pow(Math.max(size[0], size[1], size[2]) * sc * 1e-6, 4);   // |cross|² shu qiymatdan kichik bo‘lsa uchburchak yo‘q hisobi
     let mi = 0;
-    for (const it of job.items) {
+    for (const it of useItems) {
       mi++;
-      job.status = 'Rang va shakl olinmoqda… (' + mi + '/' + job.items.length + ')';
+      const emitBefore = sink.n;
+      job.status = 'Rang va shakl olinmoqda… (' + mi + '/' + useItems.length + ')';
       const mesh = it.mesh, geo = mesh.geometry, pos = geo.attributes.position, index = geo.index;
       const info = await getMatInfo(job, mesh);
       let mat = info.mat;
@@ -575,6 +626,7 @@ async function convertJob(job) {
           job.progress = done / totalTris; updateJobDom(job); last = performance.now(); await tick();
         }
       }
+      if (nT > 0 && sink.n === emitBefore) job.faceInvis.push({ name: mesh.name || 'mesh', why: 'hamma yuzasi shaffof (alfa ~0)' });
     }
     if (!sink.n) throw new Error('Hech qanday yuza olinmadi');
 
@@ -659,7 +711,7 @@ function jobHtml(job) {
     h += '<div class="info"><div>Uchburchak: <b>' + fmtNum(i.tris) + '</b></div><div>Mesh: <b>' + i.meshes + '</b></div><div>Material: <b>' + i.materials + '</b></div><div>Tekstura: <b>' + i.textures + '</b></div><div>O‘lcham: <b>' + i.size.map(fmtDim).join(' × ') + '</b></div>';
     if (job.result) {
       const r = job.result;
-      h += '<div>JSON yuza: <b>' + fmtNum(r.faces) + '</b></div><div>Uchlar: <b>' + fmtNum(r.verts) + '</b></div><div>Qism: <b>' + r.parts + '</b></div><div>Palitra: <b>' + r.palette + '</b> rang</div><div>Rang xatosi: <b>' + r.colorError.toFixed(2) + '</b>/255</div><div>Vaqt: <b>' + (r.ms / 1000).toFixed(1) + '</b> s</div><div>Koordinata: <b>' + r.decimals + '</b> raqam</div>';
+      h += '<div>JSON yuza: <b>' + fmtNum(r.faces) + '</b></div><div>Uchlar: <b>' + fmtNum(r.verts) + '</b></div><div>Qism: <b>' + r.parts + '</b></div><div>Palitra: <b>' + r.palette + '</b> rang</div><div>Rang xatosi: <b>' + r.colorError.toFixed(2) + '</b>/255</div><div>Vaqt: <b>' + (r.ms / 1000).toFixed(1) + '</b> s</div><div>Koordinata: <b>' + r.decimals + '</b> raqam</div><div>JSON o‘lcham: <b>' + r.size.map(fmtDim).join(' × ') + '</b></div>';
     }
     h += '</div>';
   }
@@ -672,6 +724,12 @@ function jobHtml(job) {
         [['auto', 'Avto (disk normali)'], ['glb', 'GLB (tugun Y o‘qi)'], ['x', 'X o‘qi'], ['y', 'Y o‘qi'], ['z', 'Z o‘qi']].map(([v, t]) => '<option value="' + v + '"' + (g.axisMode === v ? ' selected' : '') + '>' + t + '</option>').join('') + '</select></div>';
     }
     h += '</div>';
+  }
+  const rem = (job.invis || []).concat(job.faceInvis || []);
+  if (rem.length) {
+    const on = $('dropInvisible').checked;
+    h += '<div class="removed"><b>Ko‘rinmas narsalar ' + (on ? '(olib tashlanadi)' : '(olib tashlanmaydi)') + ': ' + rem.length + ' ta</b>' +
+      rem.slice(0, 8).map((r) => '<div>• ' + esc(r.name) + ' — ' + esc(r.why) + '</div>').join('') + (rem.length > 8 ? '<div>… va yana ' + (rem.length - 8) + ' ta</div>' : '') + '</div>';
   }
   for (const n of job.notes) h += '<div class="warn">' + esc(n) + '</div>';
   h += '<div class="actions">' +

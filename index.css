@@ -73,3 +73,8 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
 .viewer-bar { display: flex; gap: 6px; align-items: center; padding: 8px; background: var(--panel); }
 .viewer-title { flex: 1; font-size: 13px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #viewCanvas { flex: 1; width: 100%; min-height: 0; touch-action: none; display: block; }
+
+label.chk { flex-direction: row; align-items: center; gap: 10px; color: var(--text); font-size: 14px; }
+label.chk input { width: 22px; height: 22px; accent-color: var(--accent); flex: none; }
+.removed { background: var(--panel2); border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; font-size: 12px; color: var(--muted); display: flex; flex-direction: column; gap: 3px; word-break: break-all; }
+.removed b { color: var(--accent); font-size: 13px; }

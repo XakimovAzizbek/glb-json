@@ -67,6 +67,10 @@
           <input id="maxFaces" type="number" min="1000" step="1000" value="1000000" inputmode="numeric">
         </label>
       </div>
+      <label class="chk wide"><input id="dropInvisible" type="checkbox" checked> Ko‘rinmas narsalarni olib tashlash (kollizion kub, yashirin va to‘liq shaffof meshlar)</label>
+      <label class="wide">Yordamchi (ko‘rinmas) mesh nomlari (regex)
+        <input id="hideRe" type="text" value="(^|[^a-z])(collision|collider|collid|hitbox|hit[_ -]?box|bounds?|bbox|bounding|proxy|ucx|ubx|ucp|usp|trigger|invisible|hidden|helper|locator|occluder|navmesh|blocker)([^a-z]|$)" spellcheck="false" autocapitalize="off" autocomplete="off">
+      </label>
       <label class="wide">Aylanadigan qism nomlari (regex): nomida shu so‘z bo‘lgan tugun alohida guruh bo‘ladi va o‘yinda aylanadi
         <input id="spinRe" type="text" value="rotor|propell|propeller|blade|\bprop\b" spellcheck="false" autocapitalize="off" autocomplete="off">
       </label>
