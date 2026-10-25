@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="uz">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>GLB → JSON | DEXO GTA</title>
+  <link rel="stylesheet" href="index.css">
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <header class="top">
+    <div class="brand">DEXO <span>GLB → JSON</span></div>
+    <div class="sub">GLB modelni DEXO GTA JSON formatiga aylantiradi</div>
+  </header>
+
+  <main>
+    <section class="panel">
+      <label class="drop" id="drop" for="file">
+        <input id="file" type="file" accept=".glb,.gltf,model/gltf-binary" multiple hidden>
+        <div class="drop-title">GLB fayl tanlang</div>
+        <div class="drop-sub">Bir nechta faylni birdan tanlash mumkin. JSON nomi GLB nomi bilan bir xil bo‘ladi.</div>
+      </label>
+    </section>
+
+    <section class="panel">
+      <h2>Sozlamalar</h2>
+      <div class="grid">
+        <label>Rang aniqligi
+          <select id="preset">
+            <option value="tez">Tez (yuza boshiga bitta rang, yengil)</option>
+            <option value="yaxshi" selected>Yaxshi (tekstura tafsilotlari bilan)</option>
+            <option value="aniq">Eng aniq (juda og‘ir fayl)</option>
+          </select>
+        </label>
+        <label>Palitra rangi soni
+          <select id="palette">
+            <option value="64">64</option>
+            <option value="128">128</option>
+            <option value="256" selected>256</option>
+            <option value="512">512</option>
+            <option value="1024">1024</option>
+          </select>
+        </label>
+        <label>Silliqlash burchagi (°)
+          <input id="crease" type="number" min="0" max="180" step="1" value="40" inputmode="numeric">
+        </label>
+        <label>Masshtab
+          <input id="scale" type="number" min="0.0001" step="any" value="1" inputmode="decimal">
+        </label>
+        <label>Koordinata aniqligi
+          <select id="decimals">
+            <option value="0" selected>Avto</option>
+            <option value="2">2 raqam</option>
+            <option value="3">3 raqam</option>
+            <option value="4">4 raqam</option>
+            <option value="5">5 raqam</option>
+          </select>
+        </label>
+        <label>Maks. yuzalar soni
+          <input id="maxFaces" type="number" min="1000" step="1000" value="1000000" inputmode="numeric">
+        </label>
+      </div>
+      <label class="wide">Aylanadigan qism nomlari (regex): nomida shu so‘z bo‘lgan tugun alohida guruh bo‘ladi va o‘yinda aylanadi
+        <input id="spinRe" type="text" value="rotor|propell|propeller|blade|\bprop\b" spellcheck="false" autocapitalize="off" autocomplete="off">
+      </label>
+    </section>
+
+    <section id="jobs"></section>
+  </main>
+
+  <section id="viewer" class="viewer" hidden>
+    <div class="viewer-bar">
+      <div class="viewer-title" id="viewerTitle">Ko‘rish</div>
+      <button class="btn small" id="vGlb">GLB</button>
+      <button class="btn small" id="vJson">JSON</button>
+      <button class="btn small" id="vSpin">Aylantirish</button>
+      <button class="btn small ghost" id="vClose">Yopish</button>
+    </div>
+    <canvas id="viewCanvas"></canvas>
+  </section>
+
+  <script type="module" src="index.js"></script>
+</body>
+</html>
