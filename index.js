@@ -9,13 +9,14 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 
 // ===== CORE START =====
-// Sof hisoblash qismi (brauzer/three.js ga bog‘liq emas): rang olish, bo‘lish, palitra, JSON yig‘ish
+// Sof hisoblash qismi (brauzer/three.js ga bog‘liq emas): rang olish, adaptiv bo‘lish, palitra, JSON yig‘ish
 const S2L = new Float32Array(256);
 for (let i = 0; i < 256; i++) { const c = i / 255; S2L[i] = c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); }
 const L2S_N = 4096;
 const L2S = new Uint8Array(L2S_N + 1);
 for (let i = 0; i <= L2S_N; i++) { const l = i / L2S_N; const s = l <= 0.0031308 ? l * 12.92 : 1.055 * Math.pow(l, 1 / 2.4) - 0.055; L2S[i] = Math.round(Math.max(0, Math.min(1, s)) * 255); }
 function l2s(l) { return L2S[l <= 0 ? 0 : l >= 1 ? L2S_N : (l * L2S_N + 0.5) | 0]; }
+const tick = () => new Promise((r) => setTimeout(r, 0));
 
 function wrapIdx(i, n, mode) {
   if (mode === 33071) return i < 0 ? 0 : i >= n ? n - 1 : i;                       // CLAMP_TO_EDGE
@@ -48,7 +49,8 @@ class Sampler {
 }
 
 const _T = new Float64Array(4);
-// Uchburchakning (w0,w1,w2) barisentrik nuqtasidagi rang: PBR bazaviy rang * tekstura * uch ranglari + emissive. out = [r,g,b (sRGB 0..255), alfa 0..1]
+// Uchburchakning (w0,w1,w2) barisentrik nuqtasidagi rang: PBR bazaviy rang * tekstura * uch ranglari * AO + emissive.
+// out = [r,g,b (sRGB 0..255), alfa 0..1]
 function evalColor(c, w0, w1, w2, out) {
   const m = c.mat;
   let r = m.base[0], g = m.base[1], b = m.base[2], a = m.base[3];
@@ -62,6 +64,12 @@ function evalColor(c, w0, w1, w2, out) {
     r *= w0 * q[0] + w1 * q[4] + w2 * q[8]; g *= w0 * q[1] + w1 * q[5] + w2 * q[9]; b *= w0 * q[2] + w1 * q[6] + w2 * q[10];
     a *= w0 * q[3] + w1 * q[7] + w2 * q[11];
   }
+  if (c.uvO) {   // ambient occlusion (GLB da burchak/yoriqlar qorong‘i ko‘rinadi) rangga qo‘shiladi
+    const u = w0 * c.uvO[0] + w1 * c.uvO[2] + w2 * c.uvO[4], v = w0 * c.uvO[1] + w1 * c.uvO[3] + w2 * c.uvO[5];
+    m.texOcc.sample(u, v, _T);
+    const k = 1 - m.occStr * (1 - _T[0] / 255);
+    r *= k; g *= k; b *= k;
+  }
   if (m.emis) {
     let er = m.emis[0], eg = m.emis[1], eb = m.emis[2];
     if (c.uvE) {
@@ -74,92 +82,145 @@ function evalColor(c, w0, w1, w2, out) {
   out[0] = l2s(r); out[1] = l2s(g); out[2] = l2s(b); out[3] = a;
 }
 
+// Yuzalar ombori (typed array: xotira kam, tez). Har bir yuza: 3 uch (xyz), 3 uch normali (int8), rang (rgb), shaffoflik, guruh
 class Sink {
-  constructor() { this.P = []; this.C = []; this.A = []; this.G = []; this.n = 0; }
-  add(p0, p1, p2, p3, p4, p5, p6, p7, p8, r, g, b, bucket, gi) {
-    this.P.push(p0, p1, p2, p3, p4, p5, p6, p7, p8);
-    this.C.push(r, g, b); this.A.push(bucket); this.G.push(gi); this.n++;
+  constructor() { this.cap = 1 << 15; this.n = 0; this._alloc(); }
+  _alloc() { this.P = new Float32Array(this.cap * 9); this.N = new Int8Array(this.cap * 9); this.C = new Uint8Array(this.cap * 3); this.A = new Uint8Array(this.cap); this.G = new Int32Array(this.cap); }
+  _grow() {
+    const o = { P: this.P, N: this.N, C: this.C, A: this.A, G: this.G };
+    this.cap *= 2; this._alloc();
+    this.P.set(o.P); this.N.set(o.N); this.C.set(o.C); this.A.set(o.A); this.G.set(o.G);
+  }
+  add(p9, n9, r, g, b, bucket, gi) {
+    if (this.n >= this.cap) this._grow();
+    const i = this.n++, o = i * 9;
+    for (let k = 0; k < 9; k++) { this.P[o + k] = p9[k]; this.N[o + k] = Math.round(n9[k] * 127); }
+    this.C[i * 3] = r; this.C[i * 3 + 1] = g; this.C[i * 3 + 2] = b; this.A[i] = bucket; this.G[i] = gi;
   }
 }
 
-const _o = new Float64Array(4), _m = [0, 0], _m2 = [0, 0];
-const _samp = new Float64Array(40 * 4);
 function alphaBucket(mat, a) {
   if (mat.alphaMode === 'MASK') return a >= mat.cutoff ? 20 : 0;
   if (mat.alphaMode === 'BLEND') { if (a < 0.04) return 0; const k = Math.round(a * 20); return k >= 20 ? 20 : k < 1 ? 1 : k; }   // deyarli ko‘rinmas yuza (alfa < 0.04) olib tashlanadi
   return 20;
 }
 
-// Bitta uchburchakni (dunyo koordinatasida) ranglarini aniq olish uchun kerak bo‘lsa mayda uchburchaklarga bo‘lib sink ga yozadi.
-// P: 9 son. uvA/uvE: 6 son yoki null. vc: 12 son (uch uchun rgba) yoki null.
-function processTriangle(P, uvA, uvE, vc, mat, opt, sink, gi) {
-  const ctx = { mat, uvA: mat.texBase ? uvA : null, uvE: mat.emis && mat.texEmis ? uvE : null, vc };
-  const hasTex = !!ctx.uvA;
-  if (!hasTex && !ctx.uvE && !vc) {   // bir xil rang: bo‘lish shart emas
-    evalColor(ctx, 1 / 3, 1 / 3, 1 / 3, _o);
-    const bk = alphaBucket(mat, _o[3]);
-    if (bk > 0) sink.add(P[0], P[1], P[2], P[3], P[4], P[5], P[6], P[7], P[8], _o[0], _o[1], _o[2], bk, gi);
-    return;
+// ---------- Adaptiv aniqlashtirish ----------
+// Har bir manba uchburchak "ildiz". Bargi (leaf) = ildizning barisentrik uchburchagi. Rang tekstura bo‘yicha namunalanadi;
+// rang bir xil bo‘lmagan joylar 4 ga bo‘linadi. Bo‘lish xatosi eng katta joylardan boshlanadi va yuzalar byudjeti (opt.budget) tugaguncha davom etadi.
+const IDENT = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+const _o = new Float64Array(4), _m = [0, 0], _m2 = [0, 0], _m3 = [0, 0];
+const _samp = new Float64Array(64 * 4);
+
+function evalLeaf(root, b, depth, opt) {
+  const P = root.P, ctx = root.ctx, uvA = ctx.uvA;
+  const b0x = b[0], b0y = b[1], b0z = b[2], b1x = b[3], b1y = b[4], b1z = b[5], b2x = b[6], b2y = b[7], b2z = b[8];
+  const ax = b0x * P[0] + b0y * P[3] + b0z * P[6], ay = b0x * P[1] + b0y * P[4] + b0z * P[7], az = b0x * P[2] + b0y * P[5] + b0z * P[8];
+  const bx = b1x * P[0] + b1y * P[3] + b1z * P[6], by = b1x * P[1] + b1y * P[4] + b1z * P[7], bz = b1x * P[2] + b1y * P[5] + b1z * P[8];
+  const cx = b2x * P[0] + b2y * P[3] + b2z * P[6], cy = b2x * P[1] + b2y * P[4] + b2z * P[7], cz = b2x * P[2] + b2y * P[5] + b2z * P[8];
+  const edge = Math.max(Math.hypot(ax - bx, ay - by, az - bz), Math.hypot(bx - cx, by - cy, bz - cz), Math.hypot(cx - ax, cy - ay, cz - az));
+  let texels = 0;
+  if (uvA) {
+    const sm = ctx.mat.texBase;
+    sm.map(b0x * uvA[0] + b0y * uvA[2] + b0z * uvA[4], b0x * uvA[1] + b0y * uvA[3] + b0z * uvA[5], _m); const a0 = _m[0], a1 = _m[1];
+    sm.map(b1x * uvA[0] + b1y * uvA[2] + b1z * uvA[4], b1x * uvA[1] + b1y * uvA[3] + b1z * uvA[5], _m2); const c0 = _m2[0], c1 = _m2[1];
+    sm.map(b2x * uvA[0] + b2y * uvA[2] + b2z * uvA[4], b2x * uvA[1] + b2y * uvA[3] + b2z * uvA[5], _m3); const d0 = _m3[0], d1 = _m3[1];
+    const W = sm.w, H = sm.h;
+    texels = Math.max(Math.hypot((a0 - c0) * W, (a1 - c1) * H), Math.hypot((c0 - d0) * W, (c1 - d1) * H), Math.hypot((d0 - a0) * W, (d1 - a1) * H));
   }
-  const stack = [[1, 0, 0, 0, 1, 0, 0, 0, 1, 0]];
-  const maxDepth = sink.n > opt.maxFaces ? 0 : opt.depth;
-  while (stack.length) {
-    const s = stack.pop();
-    const b0x = s[0], b0y = s[1], b0z = s[2], b1x = s[3], b1y = s[4], b1z = s[5], b2x = s[6], b2y = s[7], b2z = s[8], depth = s[9];
-    // burchaklarning dunyodagi joyi
-    const ax = b0x * P[0] + b0y * P[3] + b0z * P[6], ay = b0x * P[1] + b0y * P[4] + b0z * P[7], az = b0x * P[2] + b0y * P[5] + b0z * P[8];
-    const bx = b1x * P[0] + b1y * P[3] + b1z * P[6], by = b1x * P[1] + b1y * P[4] + b1z * P[7], bz = b1x * P[2] + b1y * P[5] + b1z * P[8];
-    const cx = b2x * P[0] + b2y * P[3] + b2z * P[6], cy = b2x * P[1] + b2y * P[4] + b2z * P[7], cz = b2x * P[2] + b2y * P[5] + b2z * P[8];
-    // tekstura bo‘yicha o‘lcham (teksel)
-    let texels = 0;
-    if (hasTex) {
-      const U = (b) => [b[0] * uvA[0] + b[1] * uvA[2] + b[2] * uvA[4], b[0] * uvA[1] + b[1] * uvA[3] + b[2] * uvA[5]];
-      const ua = U([b0x, b0y, b0z]), ub = U([b1x, b1y, b1z]), uc = U([b2x, b2y, b2z]);
-      const sm = ctx.mat.texBase;
-      sm.map(ua[0], ua[1], _m); const a0 = _m[0], a1 = _m[1];
-      sm.map(ub[0], ub[1], _m); const c0 = _m[0], c1 = _m[1];
-      sm.map(uc[0], uc[1], _m2); const d0 = _m2[0], d1 = _m2[1];
-      const W = sm.w, H = sm.h;
-      texels = Math.max(Math.hypot((a0 - c0) * W, (a1 - c1) * H), Math.hypot((c0 - d0) * W, (c1 - d1) * H), Math.hypot((d0 - a0) * W, (d1 - a1) * H));
-    }
-    const n = hasTex ? Math.max(2, Math.min(opt.maxN, Math.ceil(texels / opt.spacing))) : 2;
-    // namunalar
-    let cnt = 0, sr = 0, sg = 0, sb = 0, sa = 0;
-    for (let i = 0; i <= n; i++) for (let j = 0; j <= n - i; j++) {
-      const q1 = i / n, q2 = j / n, q0 = 1 - q1 - q2;
-      const w0 = q0 * b0x + q1 * b1x + q2 * b2x, w1 = q0 * b0y + q1 * b1y + q2 * b2y, w2 = q0 * b0z + q1 * b1z + q2 * b2z;
-      evalColor(ctx, w0, w1, w2, _o);
-      const k = cnt * 4; _samp[k] = _o[0]; _samp[k + 1] = _o[1]; _samp[k + 2] = _o[2]; _samp[k + 3] = _o[3];
-      sr += _o[0]; sg += _o[1]; sb += _o[2]; sa += _o[3]; cnt++;
-    }
-    const mr = sr / cnt, mg = sg / cnt, mb = sb / cnt, ma = sa / cnt;
-    let dev = 0;
-    for (let k = 0; k < cnt; k++) {
-      dev = Math.max(dev, Math.abs(_samp[k * 4] - mr), Math.abs(_samp[k * 4 + 1] - mg), Math.abs(_samp[k * 4 + 2] - mb), Math.abs(_samp[k * 4 + 3] - ma) * 255);
-    }
-    const edge = Math.max(Math.hypot(ax - bx, ay - by, az - bz), Math.hypot(bx - cx, by - cy, bz - cz), Math.hypot(cx - ax, cy - ay, cz - az));
-    if (dev > opt.tol && depth < maxDepth && edge > opt.minEdge && (!hasTex || texels > 2)) {
-      const m01 = [(b0x + b1x) / 2, (b0y + b1y) / 2, (b0z + b1z) / 2], m12 = [(b1x + b2x) / 2, (b1y + b2y) / 2, (b1z + b2z) / 2], m20 = [(b2x + b0x) / 2, (b2y + b0y) / 2, (b2z + b0z) / 2];
-      const d = depth + 1;
-      stack.push([b0x, b0y, b0z, ...m01, ...m20, d], [...m01, b1x, b1y, b1z, ...m12, d], [...m20, ...m12, b2x, b2y, b2z, d], [...m01, ...m12, ...m20, d]);
-      continue;
-    }
-    const bk = alphaBucket(mat, ma);
-    if (bk > 0) sink.add(ax, ay, az, bx, by, bz, cx, cy, cz, Math.round(mr), Math.round(mg), Math.round(mb), bk, gi);
+  const n = uvA ? Math.max(2, Math.min(opt.maxN, Math.ceil(texels / opt.spacing))) : 2;
+  let cnt = 0, sr = 0, sg = 0, sb = 0, sa = 0;
+  for (let i = 0; i <= n; i++) for (let j = 0; j <= n - i; j++) {
+    const q1 = i / n, q2 = j / n, q0 = 1 - q1 - q2;
+    evalColor(ctx, q0 * b0x + q1 * b1x + q2 * b2x, q0 * b0y + q1 * b1y + q2 * b2y, q0 * b0z + q1 * b1z + q2 * b2z, _o);
+    const k = cnt * 4; _samp[k] = _o[0]; _samp[k + 1] = _o[1]; _samp[k + 2] = _o[2]; _samp[k + 3] = _o[3];
+    sr += _o[0]; sg += _o[1]; sb += _o[2]; sa += _o[3]; cnt++;
   }
+  const mr = sr / cnt, mg = sg / cnt, mb = sb / cnt, ma = sa / cnt;
+  let dev = 0;
+  for (let k = 0; k < cnt; k++) dev = Math.max(dev, Math.abs(_samp[k * 4] - mr), Math.abs(_samp[k * 4 + 1] - mg), Math.abs(_samp[k * 4 + 2] - mb), Math.abs(_samp[k * 4 + 3] - ma) * 255);
+  const can = dev > opt.tol && depth < opt.depth && edge > opt.minEdge && (!uvA || texels > 2);
+  return { root, b, depth, cr: mr, cg: mg, cb: mb, ca: ma, key: dev * edge, can };
 }
 
-// ---------- Palitra (median cut). Ranglar soni palitradan kam bo‘lsa aniq, ko‘p bo‘lsa eng yaqin ranglarga jamlanadi ----------
-function quantizeColors(C, K) {
+const _p9 = new Float64Array(9), _n9 = new Float64Array(9);
+function emitLeaf(leaf, sink) {
+  const root = leaf.root, P = root.P, N = root.N, b = leaf.b;
+  const bk = alphaBucket(root.mat, leaf.ca);
+  if (bk <= 0) return;
+  for (let k = 0; k < 3; k++) {
+    const w0 = b[k * 3], w1 = b[k * 3 + 1], w2 = b[k * 3 + 2];
+    _p9[k * 3] = w0 * P[0] + w1 * P[3] + w2 * P[6]; _p9[k * 3 + 1] = w0 * P[1] + w1 * P[4] + w2 * P[7]; _p9[k * 3 + 2] = w0 * P[2] + w1 * P[5] + w2 * P[8];
+  }
+  if (N) {   // asl normallar (silliq/qirrali soyalash GLB dagidek qoladi)
+    for (let k = 0; k < 3; k++) {
+      const w0 = b[k * 3], w1 = b[k * 3 + 1], w2 = b[k * 3 + 2];
+      const x = w0 * N[0] + w1 * N[3] + w2 * N[6], y = w0 * N[1] + w1 * N[4] + w2 * N[7], z = w0 * N[2] + w1 * N[5] + w2 * N[8];
+      const l = Math.hypot(x, y, z) || 1;
+      _n9[k * 3] = x / l; _n9[k * 3 + 1] = y / l; _n9[k * 3 + 2] = z / l;
+    }
+  } else {   // normal yo‘q: tekis (flat) soya
+    const ux = _p9[3] - _p9[0], uy = _p9[4] - _p9[1], uz = _p9[5] - _p9[2], wx = _p9[6] - _p9[0], wy = _p9[7] - _p9[1], wz = _p9[8] - _p9[2];
+    const x = uy * wz - uz * wy, y = uz * wx - ux * wz, z = ux * wy - uy * wx, l = Math.hypot(x, y, z) || 1;
+    for (let k = 0; k < 3; k++) { _n9[k * 3] = x / l; _n9[k * 3 + 1] = y / l; _n9[k * 3 + 2] = z / l; }
+  }
+  sink.add(_p9, _n9, Math.round(leaf.cr), Math.round(leaf.cg), Math.round(leaf.cb), bk, root.gi);
+}
+
+// P: 9 son (dunyo), N: 9 son (dunyo normallari) yoki null, uvA/uvE/uvO: 6 son yoki null, vc: 12 son yoki null.
+// Qiymatlar nusxalanadi (chaqiruvchi massivlarni qayta ishlatishi mumkin). Bo‘linishi kerak bo‘lganlar `active` ga tushadi.
+function processTriangle(P, N, uvA, uvE, uvO, vc, mat, opt, sink, gi, active) {
+  const ctx = { mat, uvA: mat.texBase && uvA ? Float64Array.from(uvA) : null, uvE: mat.emis && mat.texEmis && uvE ? Float64Array.from(uvE) : null, uvO: mat.texOcc && uvO ? Float64Array.from(uvO) : null, vc: vc ? Float64Array.from(vc) : null };
+  const root = { P: Float64Array.from(P), N: N ? Float64Array.from(N) : null, ctx, mat, gi };
+  if (!ctx.uvA && !ctx.uvE && !ctx.uvO && !ctx.vc) {   // bir xil rang: bo‘lish shart emas
+    evalColor(ctx, 1 / 3, 1 / 3, 1 / 3, _o);
+    emitLeaf({ root, b: IDENT, cr: _o[0], cg: _o[1], cb: _o[2], ca: _o[3] }, sink);
+    return;
+  }
+  const leaf = evalLeaf(root, IDENT, 0, opt);
+  if (leaf.can) active.push(leaf); else emitLeaf(leaf, sink);
+}
+
+async function refineLeaves(active, opt, sink, onTick, cancelled) {
+  let round = 0;
+  while (active.length) {
+    const room = Math.floor((opt.budget - (sink.n + active.length)) / 3);
+    if (room <= 0) break;
+    active.sort((x, y) => y.key - x.key);
+    const take = Math.min(room, active.length);
+    const next = [];
+    let last = performance.now();
+    for (let i = 0; i < take; i++) {
+      const l = active[i], b = l.b;
+      const m01 = [(b[0] + b[3]) / 2, (b[1] + b[4]) / 2, (b[2] + b[5]) / 2], m12 = [(b[3] + b[6]) / 2, (b[4] + b[7]) / 2, (b[5] + b[8]) / 2], m20 = [(b[6] + b[0]) / 2, (b[7] + b[1]) / 2, (b[8] + b[2]) / 2];
+      const d = l.depth + 1;
+      const kids = [[b[0], b[1], b[2], ...m01, ...m20], [...m01, b[3], b[4], b[5], ...m12], [...m20, ...m12, b[6], b[7], b[8]], [...m01, ...m12, ...m20]];
+      for (const kb of kids) { const k = evalLeaf(l.root, kb, d, opt); if (k.can) next.push(k); else emitLeaf(k, sink); }
+      active[i] = null;
+      if ((i & 255) === 0 && performance.now() - last > 60) {
+        if (cancelled && cancelled()) throw new Error('Bekor qilindi');
+        if (onTick) onTick(round, i / take, sink.n);
+        last = performance.now(); await tick();
+      }
+    }
+    for (let i = take; i < active.length; i++) next.push(active[i]);
+    active = next; round++;
+  }
+  for (const l of active) emitLeaf(l, sink);
+}
+
+// ---------- Palitra (median cut, ko‘z sezgisi og‘irliklari bilan) ----------
+const CW = [0.30, 0.59, 0.11];
+function quantizeColors(C, nC, K) {
   const counts = new Map();
-  for (let i = 0; i < C.length; i += 3) { const key = (C[i] << 16) | (C[i + 1] << 8) | C[i + 2]; counts.set(key, (counts.get(key) || 0) + 1); }
+  for (let i = 0; i < nC * 3; i += 3) { const key = (C[i] << 16) | (C[i + 1] << 8) | C[i + 2]; counts.set(key, (counts.get(key) || 0) + 1); }
   const keys = [...counts.keys()];
   const keyToPal = new Map();
-  let pal = [];
+  const pal = [];
   const mk = (items) => {
-    let mn = [255, 255, 255], mx = [0, 0, 0], pop = 0;
+    const mn = [255, 255, 255], mx = [0, 0, 0]; let pop = 0;
     for (const it of items) { pop += it.n; for (let c = 0; c < 3; c++) { if (it.v[c] < mn[c]) mn[c] = it.v[c]; if (it.v[c] > mx[c]) mx[c] = it.v[c]; } }
-    const rg = [mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]];
+    const rg = [(mx[0] - mn[0]) * CW[0], (mx[1] - mn[1]) * CW[1], (mx[2] - mn[2]) * CW[2]];
     const ch = rg[0] >= rg[1] && rg[0] >= rg[2] ? 0 : rg[1] >= rg[2] ? 1 : 2;
     return { items, ch, range: rg[ch], pop };
   };
@@ -167,7 +228,7 @@ function quantizeColors(C, K) {
     keys.sort((a, b) => a - b);
     keys.forEach((k, i) => { keyToPal.set(k, i); pal.push([k >> 16, (k >> 8) & 255, k & 255]); });
   } else {
-    let boxes = [mk(keys.map((k) => ({ k, n: counts.get(k), v: [k >> 16, (k >> 8) & 255, k & 255] })))];
+    const boxes = [mk(keys.map((k) => ({ k, n: counts.get(k), v: [k >> 16, (k >> 8) & 255, k & 255] })))];
     while (boxes.length < K) {
       let best = -1, bs = 0;
       for (let i = 0; i < boxes.length; i++) { const b = boxes[i]; if (b.items.length < 2 || b.range <= 0) continue; const sc = b.range * Math.sqrt(b.pop); if (sc > bs) { bs = sc; best = i; } }
@@ -178,20 +239,32 @@ function quantizeColors(C, K) {
       for (let i = 0; i < b.items.length - 1; i++) { acc += b.items[i].n; cut = i + 1; if (acc >= b.pop / 2) break; }
       boxes.splice(best, 1, mk(b.items.slice(0, cut)), mk(b.items.slice(cut)));
     }
+    const U = [];
     boxes.forEach((b, i) => {
       let r = 0, g = 0, bl = 0;
-      for (const it of b.items) { r += it.v[0] * it.n; g += it.v[1] * it.n; bl += it.v[2] * it.n; keyToPal.set(it.k, i); }
-      pal.push([Math.round(r / b.pop), Math.round(g / b.pop), Math.round(bl / b.pop)]);
+      for (const it of b.items) { r += it.v[0] * it.n; g += it.v[1] * it.n; bl += it.v[2] * it.n; keyToPal.set(it.k, i); U.push(it); }
+      pal.push([r / b.pop, g / b.pop, bl / b.pop]);
     });
+    // k-means (Lloyd) bilan palitrani aniqlashtirish: har bir rang eng yaqin palitra rangiga o‘tadi, markazlar qayta hisoblanadi
+    const nearest = (v) => { let bi = 0, bd = Infinity; for (let i = 0; i < pal.length; i++) { const p = pal[i], dr = v[0] - p[0], dg = v[1] - p[1], db = v[2] - p[2], d = CW[0] * dr * dr + CW[1] * dg * dg + CW[2] * db * db; if (d < bd) { bd = d; bi = i; } } return bi; };
+    if (U.length * pal.length <= 1.2e8) {
+      for (let iter = 0; iter < 3; iter++) {
+        const sum = pal.map(() => [0, 0, 0, 0]);
+        for (const it of U) { const j = nearest(it.v); const a = sum[j]; a[0] += it.v[0] * it.n; a[1] += it.v[1] * it.n; a[2] += it.v[2] * it.n; a[3] += it.n; }
+        for (let j = 0; j < pal.length; j++) if (sum[j][3] > 0) pal[j] = [sum[j][0] / sum[j][3], sum[j][1] / sum[j][3], sum[j][2] / sum[j][3]];
+      }
+      for (const it of U) keyToPal.set(it.k, nearest(it.v));
+    }
+    for (let i = 0; i < pal.length; i++) pal[i] = [Math.round(pal[i][0]), Math.round(pal[i][1]), Math.round(pal[i][2])];
   }
-  const idx = new Int32Array(C.length / 3);
+  const idx = new Int32Array(nC);
   let err = 0;
-  for (let i = 0; i < idx.length; i++) {
+  for (let i = 0; i < nC; i++) {
     const p = keyToPal.get((C[i * 3] << 16) | (C[i * 3 + 1] << 8) | C[i * 3 + 2]);
     idx[i] = p; const c = pal[p];
     err += Math.abs(c[0] - C[i * 3]) + Math.abs(c[1] - C[i * 3 + 1]) + Math.abs(c[2] - C[i * 3 + 2]);
   }
-  return { pal, idx, err: idx.length ? err / (idx.length * 3) : 0, unique: keys.length };
+  return { pal, idx, err: nC ? err / (nC * 3) : 0, unique: keys.length };
 }
 const hex2 = (v) => v.toString(16).padStart(2, '0');
 const palHex = (c) => '#' + hex2(c[0]) + hex2(c[1]) + hex2(c[2]);
@@ -235,15 +308,20 @@ function snapAxis(v) {
 
 // ---------- JSON yig‘ish: sink -> o‘yin formatidagi matn ----------
 // groups: [{ key, pivot:[x,y,z], axis:'x'|'y'|'z' }]; sink.G dagi qiymat groups indeksi yoki -1 (qotib turadigan kuzov)
+// opt.smooth === 'glb': uchlar (joy + GLB normali) bo‘yicha birlashtiriladi, o‘yin loaderi "ca": 180 bilan GLB dagi silliq/qirrali
+//   guruhlarni aynan tiklaydi. 'angle': faqat joy bo‘yicha birlashtiriladi, silliqlash burchagi opt.crease.
 function buildSpecText(sink, groups, opt, name) {
-  const P = sink.P, nF = sink.n;
-  let mn = [Infinity, Infinity, Infinity], mx = [-Infinity, -Infinity, -Infinity];
-  for (let i = 0; i < P.length; i += 3) for (let c = 0; c < 3; c++) { const v = P[i + c]; if (v < mn[c]) mn[c] = v; if (v > mx[c]) mx[c] = v; }
+  const nF = sink.n, P = sink.P, NN = sink.N;
+  const mn = [Infinity, Infinity, Infinity], mx = [-Infinity, -Infinity, -Infinity];
+  for (let i = 0; i < nF * 9; i += 3) for (let c = 0; c < 3; c++) { const v = P[i + c]; if (v < mn[c]) mn[c] = v; if (v > mx[c]) mx[c] = v; }
   const maxDim = Math.max(mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2], 1e-9);
-  const dec = opt.decimals > 0 ? opt.decimals : Math.min(6, Math.max(2, Math.ceil(Math.log10(80000 / maxDim))));
+  const dec = opt.decimals > 0 ? opt.decimals : Math.max(1, Math.min(6, Math.floor(Math.log10(131000 / maxDim))));
   const s10 = Math.pow(10, dec);
-  const q = quantizeColors(sink.C, opt.palette);
-  // paketlash: (guruh, shaffoflik) bo‘yicha
+  const off = [-Math.floor(mn[0] * s10) + 1, -Math.floor(mn[1] * s10) + 1, -Math.floor(mn[2] * s10) + 1];
+  const useNum = (mx[0] - mn[0]) * s10 < 131000 && (mx[1] - mn[1]) * s10 < 131000 && (mx[2] - mn[2]) * s10 < 131000;
+  const byNormal = opt.smooth !== 'angle';
+  const cosC = byNormal ? 0.97 : -2;
+  const q = quantizeColors(sink.C, nF, opt.palette);
   const buckets = new Map();
   for (let f = 0; f < nF; f++) {
     const gi = sink.G[f];
@@ -264,15 +342,22 @@ function buildSpecText(sink, groups, opt, name) {
     const faces = buckets.get(key);
     const gi = Math.floor(key / 100) < 0 ? -1 : Math.floor(key / 100);
     const bk = key - Math.floor(key / 100) * 100;
-    const map = new Map(), verts = [], idx = [], fcs = [];
+    const map = new Map(), verts = [], nrm = [], nxt = [], idx = [], fcs = [];
+    const ids = [0, 0, 0];
     for (const f of faces) {
-      const ids = [0, 0, 0];
       for (let k = 0; k < 3; k++) {
-        const ix = Math.round(P[f * 9 + k * 3] * s10), iy = Math.round(P[f * 9 + k * 3 + 1] * s10), iz = Math.round(P[f * 9 + k * 3 + 2] * s10);
-        const kk = ix + ',' + iy + ',' + iz;
-        let id = map.get(kk);
-        if (id === undefined) { id = verts.length / 3; map.set(kk, id); verts.push(ix, iy, iz); }
-        ids[k] = id;
+        const o = f * 9 + k * 3;
+        const ix = Math.round(P[o] * s10), iy = Math.round(P[o + 1] * s10), iz = Math.round(P[o + 2] * s10);
+        const kk = useNum ? ((ix + off[0]) * 131072 + (iy + off[1])) * 131072 + (iz + off[2]) : ix + ',' + iy + ',' + iz;
+        const nx = NN[o] / 127, ny = NN[o + 1] / 127, nz = NN[o + 2] / 127;
+        const head = map.get(kk);
+        let id = head, found = -1;
+        while (id !== undefined && id !== -1) {
+          if (!byNormal || nrm[id * 3] * nx + nrm[id * 3 + 1] * ny + nrm[id * 3 + 2] * nz >= cosC) { found = id; break; }
+          id = nxt[id];
+        }
+        if (found < 0) { found = verts.length / 3; verts.push(ix, iy, iz); nrm.push(nx, ny, nz); nxt.push(head === undefined ? -1 : head); map.set(kk, found); }
+        ids[k] = found;
       }
       if (ids[0] === ids[1] || ids[1] === ids[2] || ids[0] === ids[2]) continue;
       idx.push(ids[0], ids[1], ids[2]); fcs.push(q.idx[f]);
@@ -284,7 +369,7 @@ function buildSpecText(sink, groups, opt, name) {
     for (let i = 0; i < verts.length; i++) vs[i] = verts[i] / s10;
     let s = '    {"t": "mesh"';
     if (gi >= 0) s += ', "g": ' + JSON.stringify(groups[gi].key);
-    s += ', "ca": ' + opt.crease;
+    s += ', "ca": ' + (byNormal ? 180 : opt.crease);
     if (gi < 0 && bk < 20) s += ', "o": ' + (bk / 20);
     if (used.length === 1) s += ', "c": "' + palHex(q.pal[used[0]]) + '"';
     else s += ', "pal": ' + JSON.stringify(used.map((g) => palHex(q.pal[g])));
@@ -304,18 +389,19 @@ function buildSpecText(sink, groups, opt, name) {
 }
 // ===== CORE END =====
 
+
 // ===================== BRAUZER QISMI (GLB o‘qish, interfeys, ko‘rish) =====================
 const $ = (id) => document.getElementById(id);
-const tick = () => new Promise((r) => setTimeout(r, 0));
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const fmtBytes = (n) => (n >= 1048576 ? (n / 1048576).toFixed(2) + ' MB' : Math.max(1, Math.round(n / 1024)) + ' KB');
 const fmtNum = (n) => Number(n).toLocaleString('en-US').replace(/,/g, ' ');
 const fmtDim = (v) => (Math.abs(v) >= 100 ? v.toFixed(1) : v.toFixed(2));
 
 const PRESETS = {
-  tez: { depth: 0, tol: 9999, maxN: 4, spacing: 8 },       // har bir uchburchak = bitta rang (eng yengil)
-  yaxshi: { depth: 2, tol: 16, maxN: 4, spacing: 6 },      // rang o‘zgargan joylar mayda uchburchaklarga bo‘linadi
-  aniq: { depth: 4, tol: 8, maxN: 6, spacing: 4 },         // juda aniq, lekin fayl katta bo‘ladi
+  // depth: eng chuqur bo‘lish; tol: rang farqi chegarasi (0..255); mul/minBudget: yuzalar byudjeti (asl yuzalar sonining necha baravari)
+  tez: { depth: 0, tol: 1e9, maxN: 4, spacing: 8, mul: 1, minBudget: 0 },            // yuza boshiga bitta rang (eng yengil)
+  yaxshi: { depth: 6, tol: 9, maxN: 4, spacing: 6, mul: 3, minBudget: 80000 },       // tekstura tafsilotlari, o‘rtacha hajm
+  aniq: { depth: 8, tol: 5, maxN: 6, spacing: 4, mul: 10, minBudget: 250000 },       // GLB ga eng yaqin, fayl katta
 };
 
 const gltfLoader = new GLTFLoader();
@@ -336,14 +422,41 @@ function readOptions() {
   const p = PRESETS[$('preset').value] || PRESETS.yaxshi;
   return {
     ...p,
-    palette: parseInt($('palette').value, 10) || 256,
+    palette: parseInt($('palette').value, 10) || 512,
     crease: Math.round(numVal('crease', 40, 0, 180)),
+    smooth: $('smooth').value === 'angle' ? 'angle' : 'glb',
     scale: numVal('scale', 1, 1e-6, 1e6),
     decimals: parseInt($('decimals').value, 10) || 0,
     maxFaces: Math.round(numVal('maxFaces', 1000000, 1000, 20000000)),
     dropInvisible: $('dropInvisible').checked,
+    ao: $('ao').checked,
   };
 }
+
+// Sozlamalarni eslab qolish
+const SAVE_KEY = 'dexo_glb2json_v2';
+const SAVE_FIELDS = ['preset', 'palette', 'crease', 'smooth', 'scale', 'decimals', 'maxFaces', 'spinRe', 'hideRe'];
+const SAVE_CHECKS = ['dropInvisible', 'ao'];
+function saveOptions() {
+  try {
+    const o = {};
+    for (const id of SAVE_FIELDS) o[id] = $(id).value;
+    for (const id of SAVE_CHECKS) o[id] = $(id).checked;
+    localStorage.setItem(SAVE_KEY, JSON.stringify(o));
+  } catch (e) { /* xotira yopiq bo‘lishi mumkin */ }
+}
+function loadOptions() {
+  try {
+    const o = JSON.parse(localStorage.getItem(SAVE_KEY) || 'null');
+    if (!o) return;
+    for (const id of SAVE_FIELDS) if (typeof o[id] === 'string') $(id).value = o[id];
+    for (const id of SAVE_CHECKS) if (typeof o[id] === 'boolean') $(id).checked = o[id];
+  } catch (e) { /* e'tiborsiz */ }
+}
+loadOptions();
+for (const id of [...SAVE_FIELDS, ...SAVE_CHECKS]) $(id).addEventListener('change', saveOptions);
+$('smooth').addEventListener('change', () => { $('crease').disabled = $('smooth').value !== 'angle'; });
+$('crease').disabled = $('smooth').value !== 'angle';
 
 // ---------- Fayllarni qo‘shish ----------
 const drop = $('drop');
@@ -409,6 +522,27 @@ async function analyze(job) {
 // ---------- Ko‘rinmas narsalar ----------
 // GLB da ko‘rinmas, lekin geometriyasi bor narsalar (kollizion kub, yordamchi mesh, to‘liq shaffof material) JSON ga o‘tmaydi:
 // aks holda ular modelning o‘lchamini kattalashtirib, o‘yinda mashina devorga yetmasdan urilishiga sabab bo‘ladi.
+// Bir tomonli materialda, yuzalari ichkariga qaragan yopiq qobiq (masalan, normallari teskari kub) GLB da tashqaridan ko‘rinmaydi,
+// lekin JSON da ikki tomonlama chizilgani uchun ko‘rinib qolardi. Imzolangan hajm < 0 va qobiq bbox ni yetarli to‘ldirsa shunday deb hisoblanadi.
+function inwardShell(mesh) {
+  const g = mesh.geometry, pos = g.attributes.position, index = g.index;
+  const nT = Math.floor((index ? index.count : pos.count) / 3);
+  if (nT < 12) return false;
+  if (!g.boundingBox) g.computeBoundingBox();
+  const bb = g.boundingBox; if (!bb || bb.isEmpty()) return false;
+  const sz = bb.getSize(new THREE.Vector3()), bv = sz.x * sz.y * sz.z;
+  if (!(bv > 0)) return false;
+  const c = bb.getCenter(new THREE.Vector3());
+  let vol = 0;
+  for (let t = 0; t < nT; t++) {
+    const ia = index ? index.getX(t * 3) : t * 3, ib = index ? index.getX(t * 3 + 1) : t * 3 + 1, ic = index ? index.getX(t * 3 + 2) : t * 3 + 2;
+    const ax = pos.getX(ia) - c.x, ay = pos.getY(ia) - c.y, az = pos.getZ(ia) - c.z;
+    const bx = pos.getX(ib) - c.x, by = pos.getY(ib) - c.y, bz = pos.getZ(ib) - c.z;
+    const cx = pos.getX(ic) - c.x, cy = pos.getY(ic) - c.y, cz = pos.getZ(ic) - c.z;
+    vol += (ax * (by * cz - bz * cy) + ay * (bz * cx - bx * cz) + az * (bx * cy - by * cx)) / 6;
+  }
+  return vol < 0 && -vol >= 0.15 * bv;
+}
 function markInvisible(job) {
   if (!job.gltf) return;
   let re = null;
@@ -430,6 +564,7 @@ function markInvisible(job) {
       for (let n = mesh.parent; n && n !== job.gltf.scene; n = n.parent) names.push(n.name);
       if (names.some((n) => n && re.test(n))) why = 'yordamchi/kollizion nom';
     }
+    if (!why && def && !def.doubleSided && inwardShell(mesh)) why = 'ichkariga qaragan qobiq (GLB da tashqaridan ko‘rinmaydi)';
     if (!why) {
       const g = mesh.geometry;
       if (!g.boundingBox) g.computeBoundingBox();
@@ -530,7 +665,7 @@ async function makeSampler(job, texInfo) {
 }
 
 async function buildMatInfo(job, idx, tm) {
-  const info = { mat: { base: [1, 1, 1, 1], emis: null, texBase: null, texEmis: null, alphaMode: 'OPAQUE', cutoff: 0.5 }, chBase: 0, chEmis: 0 };
+  const info = { mat: { base: [1, 1, 1, 1], emis: null, texBase: null, texEmis: null, texOcc: null, occStr: 1, alphaMode: 'OPAQUE', cutoff: 0.5 }, chBase: 0, chEmis: 0, chOcc: 0 };
   const def = idx !== null ? job.json.materials[idx] : null;
   if (!def) {
     if (tm && tm.color) { info.mat.base = [tm.color.r, tm.color.g, tm.color.b, tm.opacity === undefined ? 1 : tm.opacity]; info.mat.alphaMode = tm.transparent ? 'BLEND' : 'OPAQUE'; }
@@ -547,6 +682,10 @@ async function buildMatInfo(job, idx, tm) {
   if (trn && trn.transmissionFactor > 0 && info.mat.alphaMode === 'OPAQUE') { info.mat.alphaMode = 'BLEND'; info.mat.base[3] *= Math.max(0.12, 1 - 0.85 * trn.transmissionFactor); }   // shaffof shisha: to‘q rangli qattiq jism bo‘lib qolmasin
   const bs = await makeSampler(job, baseT);
   if (bs) { info.mat.texBase = bs.sampler; info.chBase = bs.ch; }
+  if (def.occlusionTexture) {
+    const os = await makeSampler(job, def.occlusionTexture);
+    if (os) { info.mat.texOcc = os.sampler; info.chOcc = os.ch; info.mat.occStr = def.occlusionTexture.strength === undefined ? 1 : def.occlusionTexture.strength; }
+  }
   const ef = def.emissiveFactor;
   if (ef && (ef[0] || ef[1] || ef[2])) {
     const st = (def.extensions && def.extensions.KHR_materials_emissive_strength && def.extensions.KHR_materials_emissive_strength.emissiveStrength) || 1;
@@ -569,7 +708,8 @@ async function getMatInfo(job, mesh) {
 // ---------- Aylantirish ----------
 async function convertJob(job) {
   if (job.busy || !job.gltf) return;
-  job.busy = true; job.result = null; job.previewJson = null; job.faceInvis = []; job.notes = job.notes.filter((n) => /kichraytirildi|KTX2|Tekstura|Hamma mesh/.test(n));
+  job.busy = true; job.cancel = false; job.result = null; job.previewJson = null; job.faceInvis = [];
+  job.notes = job.notes.filter((n) => /kichraytirildi|KTX2|Tekstura|Hamma mesh/.test(n));
   const t0 = performance.now();
   const opt = readOptions();
   job.status = 'Boshlanmoqda…'; job.statusClass = ''; job.progress = 0;
@@ -579,28 +719,35 @@ async function convertJob(job) {
     const sc = opt.scale;
     const size = job.info.size;
     opt.minEdge = Math.max(size[0], size[1], size[2]) * sc * 2e-4;
-    const sink = new Sink();
-    let totalTris = 0;
     const useItems = job.items.filter((it) => !(opt.dropInvisible && it.skip));
+    let totalTris = 0;
     for (const it of useItems) { const g = it.mesh.geometry; totalTris += Math.floor((g.index ? g.index.count : g.attributes.position.count) / 3); }
+    opt.budget = opt.mul <= 1 ? totalTris : Math.min(opt.maxFaces, Math.max(opt.minBudget, Math.round(totalTris * opt.mul)));
+    const sink = new Sink();
+    const active = [];
     let done = 0, last = performance.now();
-    const P = new Float64Array(9), uvA = new Float64Array(6), uvE = new Float64Array(6), vcA = new Float64Array(12);
+    const P = new Float64Array(9), N = new Float64Array(9), uvA = new Float64Array(6), uvE = new Float64Array(6), uvO = new Float64Array(6), vcA = new Float64Array(12);
     const groupIdx = new Map(job.groups.map((g, i) => [g, i]));
     const degEps = Math.pow(Math.max(size[0], size[1], size[2]) * sc * 1e-6, 4);   // |cross|² shu qiymatdan kichik bo‘lsa uchburchak yo‘q hisobi
+    const uvName = (ch) => (ch === 0 ? 'uv' : 'uv' + ch);
     let mi = 0;
     for (const it of useItems) {
       mi++;
-      const emitBefore = sink.n;
+      const emitBefore = sink.n + active.length;
       job.status = 'Rang va shakl olinmoqda… (' + mi + '/' + useItems.length + ')';
-      const mesh = it.mesh, geo = mesh.geometry, pos = geo.attributes.position, index = geo.index;
+      const mesh = it.mesh, geo = mesh.geometry, pos = geo.attributes.position, index = geo.index, nAttr = geo.attributes.normal;
       const info = await getMatInfo(job, mesh);
-      let mat = info.mat;
-      const aB = mat.texBase ? geo.attributes[info.chBase === 0 ? 'uv' : 'uv' + info.chBase] : null;
-      const aE = mat.emis && mat.texEmis ? geo.attributes[info.chEmis === 0 ? 'uv' : 'uv' + info.chEmis] : null;
-      if ((mat.texBase && !aB) || (mat.texEmis && !aE)) mat = { ...mat, texBase: aB ? mat.texBase : null, texEmis: aE ? mat.texEmis : null };
+      const mat = { ...info.mat, occStr: info.mat.occStr * 0.7 };   // GLB da AO faqat atrof yorug‘likni qoraytiradi: rangga qisman qo‘shiladi
+      const aB = mat.texBase ? geo.attributes[uvName(info.chBase)] : null;
+      const aE = mat.emis && mat.texEmis ? geo.attributes[uvName(info.chEmis)] : null;
+      const aO = mat.texOcc && opt.ao ? geo.attributes[uvName(info.chOcc)] : null;
+      if (!aB) mat.texBase = null;
+      if (!aE) mat.texEmis = null;
+      if (!aO) mat.texOcc = null;
       const tm = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
       const ca = tm && tm.vertexColors && geo.attributes.color ? geo.attributes.color : null;
       const e = mesh.matrixWorld.elements;
+      const nm = nAttr ? new THREE.Matrix3().getNormalMatrix(mesh.matrixWorld).elements : null;
       const flip = mesh.matrixWorld.determinant() < 0;
       const gi = it.group ? groupIdx.get(it.group) : -1;
       const nT = Math.floor((index ? index.count : pos.count) / 3);
@@ -617,17 +764,37 @@ async function convertJob(job) {
         const ux = P[3] - P[0], uy = P[4] - P[1], uz = P[5] - P[2], wx = P[6] - P[0], wy = P[7] - P[1], wz = P[8] - P[2];
         const cx = uy * wz - uz * wy, cy = uz * wx - ux * wz, cz = ux * wy - uy * wx;
         if (cx * cx + cy * cy + cz * cz < degEps) { done++; continue; }   // yuzasi nolga teng uchburchak
+        if (nAttr) {
+          for (let k = 0; k < 3; k++) {
+            const x = nAttr.getX(vs[k]), y = nAttr.getY(vs[k]), z = nAttr.getZ(vs[k]);
+            const nx = nm[0] * x + nm[3] * y + nm[6] * z, ny = nm[1] * x + nm[4] * y + nm[7] * z, nz = nm[2] * x + nm[5] * y + nm[8] * z;
+            const l = Math.hypot(nx, ny, nz) || 1;
+            N[k * 3] = nx / l; N[k * 3 + 1] = ny / l; N[k * 3 + 2] = nz / l;
+          }
+        }
         if (aB) for (let k = 0; k < 3; k++) { uvA[k * 2] = aB.getX(vs[k]); uvA[k * 2 + 1] = aB.getY(vs[k]); }
         if (aE) for (let k = 0; k < 3; k++) { uvE[k * 2] = aE.getX(vs[k]); uvE[k * 2 + 1] = aE.getY(vs[k]); }
+        if (aO) for (let k = 0; k < 3; k++) { uvO[k * 2] = aO.getX(vs[k]); uvO[k * 2 + 1] = aO.getY(vs[k]); }
         if (ca) for (let k = 0; k < 3; k++) { vcA[k * 4] = ca.getX(vs[k]); vcA[k * 4 + 1] = ca.getY(vs[k]); vcA[k * 4 + 2] = ca.getZ(vs[k]); vcA[k * 4 + 3] = ca.itemSize > 3 ? ca.getW(vs[k]) : 1; }
-        processTriangle(P, aB ? uvA : null, aE ? uvE : null, ca ? vcA : null, mat, opt, sink, gi);
+        processTriangle(P, nAttr ? N : null, aB ? uvA : null, aE ? uvE : null, aO ? uvO : null, ca ? vcA : null, mat, opt, sink, gi, active);
         done++;
         if ((t & 127) === 0 && performance.now() - last > 60) {
-          job.progress = done / totalTris; updateJobDom(job); last = performance.now(); await tick();
+          if (job.cancel) throw new Error('Bekor qilindi');
+          job.progress = (done / totalTris) * 0.6; updateJobDom(job); last = performance.now(); await tick();
         }
       }
-      if (nT > 0 && sink.n === emitBefore) job.faceInvis.push({ name: mesh.name || 'mesh', why: 'hamma yuzasi shaffof (alfa ~0)' });
+      if (nT > 0 && sink.n + active.length === emitBefore) job.faceInvis.push({ name: mesh.name || 'mesh', why: 'hamma yuzasi shaffof (alfa ~0)' });
     }
+    if (job.cancel) throw new Error('Bekor qilindi');
+
+    // Tafsilotlarni aniqlashtirish: rang farqi eng katta joylardan boshlab, byudjet tugaguncha
+    job.status = 'Tafsilotlar aniqlashtirilmoqda…'; updateJobDom(job);
+    const preActive = active.length;
+    await refineLeaves(active, opt, sink, (round, frac, n) => {
+      job.progress = 0.6 + 0.3 * Math.min(1, (sink.n + 1) / opt.budget);
+      job.status = 'Tafsilotlar aniqlashtirilmoqda… ' + fmtNum(sink.n) + ' yuza (' + (round + 1) + '-bosqich)';
+      updateJobDom(job);
+    }, () => job.cancel);
     if (!sink.n) throw new Error('Hech qanday yuza olinmadi');
 
     // Aylanadigan guruhlar: markaz va o‘q
@@ -638,7 +805,7 @@ async function convertJob(job) {
       const g = job.groups[oldI];
       const pts = [];
       const step = Math.max(1, Math.floor(faces.length / 20000));
-      let mn = [Infinity, Infinity, Infinity], mx = [-Infinity, -Infinity, -Infinity];
+      const mn = [Infinity, Infinity, Infinity], mx = [-Infinity, -Infinity, -Infinity];
       for (let q = 0; q < faces.length; q++) {
         const f = faces[q];
         for (let k = 0; k < 3; k++) for (let c = 0; c < 3; c++) { const v = sink.P[f * 9 + k * 3 + c]; if (v < mn[c]) mn[c] = v; if (v > mx[c]) mx[c] = v; }
@@ -659,19 +826,19 @@ async function convertJob(job) {
     }
     for (let f = 0; f < sink.n; f++) if (sink.G[f] >= 0) sink.G[f] = remap.get(sink.G[f]);
 
-    job.status = 'JSON yozilmoqda…'; job.progress = 1; updateJobDom(job); await tick();
+    job.status = 'JSON yozilmoqda…'; job.progress = 0.95; updateJobDom(job); await tick();
     const res = buildSpecText(sink, gInfo, opt, job.base);
-    res.faceSplit = sink.n;
+    res.srcFaces = totalTris;
     res.ms = performance.now() - t0;
     res.groups = gInfo.length;
     job.result = res;
     job.status = 'Tayyor: ' + job.base + '.json (' + fmtBytes(res.text.length) + ')';
     job.statusClass = 'ok';
-    if (sink.n > opt.maxFaces) job.notes.push('Yuzalar soni chegaradan oshdi: keyingi uchburchaklar bo‘linmadi.');
+    if (opt.mul > 1 && sink.n >= opt.budget * 0.98) job.notes.push('Yuzalar byudjeti (' + fmtNum(opt.budget) + ') to‘ldi. Yana aniqroq kerak bo‘lsa “Maks. yuzalar soni” ni oshiring yoki “Eng aniq” ni tanlang.');
     if (res.text.length > 12 * 1048576) job.notes.push('Fayl katta (' + fmtBytes(res.text.length) + '). O‘yinda yuklash sekin bo‘lsa “Yaxshi” yoki “Tez” ni tanlang.');
   } catch (err) {
     console.error(err);
-    job.status = 'Xatolik: ' + (err && err.message ? err.message : err);
+    job.status = err && err.message === 'Bekor qilindi' ? 'Bekor qilindi' : 'Xatolik: ' + (err && err.message ? err.message : err);
     job.statusClass = 'bad';
   }
   job.busy = false; job.progress = -1;
@@ -711,7 +878,7 @@ function jobHtml(job) {
     h += '<div class="info"><div>Uchburchak: <b>' + fmtNum(i.tris) + '</b></div><div>Mesh: <b>' + i.meshes + '</b></div><div>Material: <b>' + i.materials + '</b></div><div>Tekstura: <b>' + i.textures + '</b></div><div>O‘lcham: <b>' + i.size.map(fmtDim).join(' × ') + '</b></div>';
     if (job.result) {
       const r = job.result;
-      h += '<div>JSON yuza: <b>' + fmtNum(r.faces) + '</b></div><div>Uchlar: <b>' + fmtNum(r.verts) + '</b></div><div>Qism: <b>' + r.parts + '</b></div><div>Palitra: <b>' + r.palette + '</b> rang</div><div>Rang xatosi: <b>' + r.colorError.toFixed(2) + '</b>/255</div><div>Vaqt: <b>' + (r.ms / 1000).toFixed(1) + '</b> s</div><div>Koordinata: <b>' + r.decimals + '</b> raqam</div><div>JSON o‘lcham: <b>' + r.size.map(fmtDim).join(' × ') + '</b></div>';
+      h += '<div>JSON yuza: <b>' + fmtNum(r.faces) + '</b></div><div>Uchlar: <b>' + fmtNum(r.verts) + '</b></div><div>Aslida: <b>' + fmtNum(r.srcFaces) + '</b> yuza</div><div>Qism: <b>' + r.parts + '</b></div><div>Palitra: <b>' + r.palette + '</b> rang</div><div>Rang xatosi: <b>' + r.colorError.toFixed(2) + '</b>/255</div><div>Vaqt: <b>' + (r.ms / 1000).toFixed(1) + '</b> s</div><div>Koordinata: <b>' + r.decimals + '</b> raqam</div><div>JSON o‘lcham: <b>' + r.size.map(fmtDim).join(' × ') + '</b></div>';
     }
     h += '</div>';
   }
@@ -733,12 +900,20 @@ function jobHtml(job) {
   }
   for (const n of job.notes) h += '<div class="warn">' + esc(n) + '</div>';
   h += '<div class="actions">' +
-    '<button class="btn primary" data-act="convert"' + (job.busy || !job.gltf ? ' disabled' : '') + '>Aylantirish</button>' +
+    (job.busy ? '<button class="btn" data-act="cancel">To‘xtatish</button>' : '<button class="btn primary" data-act="convert"' + (!job.gltf ? ' disabled' : '') + '>Aylantirish</button>') +
     '<button class="btn" data-act="download"' + (job.result ? '' : ' disabled') + '>Yuklab olish (' + esc(job.base) + '.json)</button>' +
     '<button class="btn" data-act="view"' + (job.gltf && !job.busy ? '' : ' disabled') + '>Ko‘rish</button>' +
     '<button class="btn ghost" data-act="remove"' + (job.busy ? ' disabled' : '') + '>Olib tashlash</button></div>';
   return h;
 }
+function updateBulk() {
+  const el = $('bulk'); if (!el) return;
+  el.hidden = jobs.length < 2;
+  $('convertAll').disabled = jobs.some((j) => j.busy) || !jobs.some((j) => j.gltf);
+  $('downloadAll').disabled = !jobs.some((j) => j.result);
+}
+$('convertAll').addEventListener('click', async () => { for (const j of jobs.slice()) if (j.gltf && !j.busy && jobs.includes(j)) await convertJob(j); });
+$('downloadAll').addEventListener('click', async () => { for (const j of jobs.slice()) if (j.result) { downloadJob(j); await new Promise((r) => setTimeout(r, 400)); } });
 function renderJobs() {
   const box = $('jobs');
   const keep = new Map();
@@ -749,6 +924,7 @@ function renderJobs() {
     keep.set(String(job.id), el);
   }
   [...box.children].forEach((el) => { if (!keep.has(el.dataset.job)) el.remove(); });
+  updateBulk();
 }
 function updateJobDom(job) {
   const el = $('jobs').querySelector('[data-job="' + job.id + '"]');
@@ -762,6 +938,7 @@ $('jobs').addEventListener('click', (e) => {
   const el = b.closest('[data-job]'); const job = jobs.find((j) => String(j.id) === el.dataset.job); if (!job) return;
   const act = b.dataset.act;
   if (act === 'convert') convertJob(job);
+  else if (act === 'cancel') job.cancel = true;
   else if (act === 'download') downloadJob(job);
   else if (act === 'remove') removeJob(job);
   else if (act === 'view') openViewer(job);
